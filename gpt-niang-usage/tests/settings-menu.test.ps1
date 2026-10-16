@@ -11,6 +11,11 @@ function Position-WidgetMenuToHost {}
 function Set-Appearance {}
 function Set-WidgetAudioVolume {}
 function Stop-WidgetAudio {}
+$widgetSource=[IO.File]::ReadAllText((Join-Path $appDir 'widget.ps1'),[Text.Encoding]::UTF8)
+$widgetAst=[Management.Automation.Language.Parser]::ParseInput($widgetSource,[ref]$null,[ref]$null)
+$autoQuotes=$widgetAst.Find({param($n)$n-is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name-eq 'Set-WidgetAutoQuotes'},$true)
+. ([ScriptBlock]::Create($autoQuotes.Extent.Text))
+function Stop-AutoQuotePress {}
 . (Join-Path $appDir 'runtime\supervisor-task.ps1')
 . (Join-Path $appDir 'runtime\update-common.ps1')
 . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $appDir 'runtime\update-ui.ps1'),[Text.Encoding]::UTF8)))
@@ -22,6 +27,7 @@ $script:window=New-Object Windows.Window
 $script:collapsed=$true;$script:bubbleMode='quota';$script:followHost=$true;$script:desktopTopmost=$true
 $script:scale=1.0;$script:soundOn=$true;$script:soundVolume=0.9;$script:bubbleTapAdvance=$false;$script:hideMenu=$false
 $script:colorMode='mixed';$script:colorChance=0.5;$script:colorTextChance=3;$script:colorPaused=$false
+$script:autoQuotesOn=$true;$script:autoQuoteNextAt=12345
 try{
   Initialize-WidgetSettingsMenu
   $expected=@('查看额度','换一句台词','刷新额度','编辑我的语录','显示与位置','外观设置','声音与点击','更新','退出 GPT 娘')
@@ -33,8 +39,13 @@ try{
   $script:settingsMenuUi.AutoUpdate.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.MenuItem]::ClickEvent))
   Assert-Equal (Read-WidgetUpdateJson (Join-Path $script:dataDir 'update-preferences.json')).automatic $false 'Menu toggle persists separately'
   Assert-Equal $script:settingsMenuUi.Topmost.Visibility Collapsed 'Window mode hides topmost'
+  Assert-Equal $script:settingsMenuUi.AutoQuotes.IsChecked $true 'Automatic quotes are on initially'
+  $script:settingsMenuUi.AutoQuotes.IsChecked=$false
+  $script:settingsMenuUi.AutoQuotes.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.MenuItem]::ClickEvent))
+  Assert-Equal $script:autoQuotesOn $false 'Automatic quote toggle updates runtime state'
+  Assert-Equal $script:autoQuoteNextAt 0 'Toggle discards pending deadline'
   Assert-Equal $script:settingsMenuUi.TopmostDivider.Visibility Collapsed 'Window mode hides its divider'
-  foreach($name in @('Follow','Desktop','Topmost','Hide','Sound','Tap')){
+  foreach($name in @('Follow','Desktop','Topmost','Hide','Sound','Tap','AutoQuotes')){
     Assert-Equal $script:settingsMenuUi[$name].StaysOpenOnClick $true 'All settings retain menu interaction'
     Assert-Equal $script:settingsMenuUi[$name].Style $script:settingsMenuResources['SettingsItem'] 'Rows share the same style'
   }

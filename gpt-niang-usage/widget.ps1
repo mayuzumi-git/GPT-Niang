@@ -113,6 +113,7 @@ $script:status=$null
 $script:statusStamp=0
 $script:offsetRight=0.0;$script:offsetBottom=0.0;$script:offsetLeft=$null;$script:anchor='right';$script:side='right';$script:scale=1.0;$script:collapsed=$true
 $script:soundOn=$true;$script:soundVolume=0.9;$script:bubbleTapAdvance=$false;$script:hideMenu=$false
+$script:autoQuotesOn=$true;$script:autoQuoteNextAt=0;$script:autoQuotePressTimer=$null
 $script:followHost=$true;$script:desktopTopmost=$false;$script:desktopLeft=$null;$script:desktopTop=$null
 $script:hostReadiness=New-WidgetReadinessState
 $script:bubbleMode='quota';$script:sceneStartedAt=0;$script:sceneDeadline=0;$script:sceneTimer=$null;$script:sceneRevision=0
@@ -131,6 +132,7 @@ try{$settings=Get-Content -LiteralPath $settingsFile -Raw -Encoding UTF8 | Conve
   if($null-ne $settings.soundOn){$script:soundOn=[bool]$settings.soundOn}
   if($null-ne $settings.soundVolume){$script:soundVolume=[Math]::Min(1,[Math]::Max(0,[double]$settings.soundVolume))}
   if($null-ne $settings.bubbleTapAdvance){$script:bubbleTapAdvance=[bool]$settings.bubbleTapAdvance}
+  if($null-ne $settings.autoQuotesOn){$script:autoQuotesOn=[bool]$settings.autoQuotesOn}
   if($null-ne $settings.hideMenu){$script:hideMenu=[bool]$settings.hideMenu}
   if(@('original','linked','rainbow','surprise','rare','special','mixed')-contains $settings.colorMode){$script:colorMode=$settings.colorMode}
   if($null-ne $settings.colorChance){try{$chance=[double]$settings.colorChance;if(![double]::IsNaN($chance) -and $chance-ge 0 -and $chance-le 30){$script:colorChance=$chance}}catch{}}
@@ -145,7 +147,7 @@ function Write-WidgetJson($file,$value){
   $temp=$file+'.tmp';[IO.File]::WriteAllText($temp,($value|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
   if([IO.File]::Exists($file)){[IO.File]::Replace($temp,$file,($file+'.bak'),$true)}else{[IO.File]::Move($temp,$file)}
 }
-function Save-Settings {Write-WidgetJson $settingsFile @{layoutVersion=2;right=$script:offsetRight;left=$script:offsetLeft;bottom=$script:offsetBottom;anchor=$script:anchor;side=$script:side;scale=$script:scale;collapsed=$script:collapsed;soundOn=$script:soundOn;soundVolume=$script:soundVolume;bubbleTapAdvance=$script:bubbleTapAdvance;hideMenu=$script:hideMenu;colorMode=$script:colorMode;colorChance=$script:colorChance;colorTextChance=$script:colorTextChance;colorPaused=$script:colorPaused;followHost=$script:followHost;desktopTopmost=$script:desktopTopmost;desktopLeft=$script:desktopLeft;desktopTop=$script:desktopTop}}
+function Save-Settings {Write-WidgetJson $settingsFile @{layoutVersion=2;right=$script:offsetRight;left=$script:offsetLeft;bottom=$script:offsetBottom;anchor=$script:anchor;side=$script:side;scale=$script:scale;collapsed=$script:collapsed;soundOn=$script:soundOn;soundVolume=$script:soundVolume;bubbleTapAdvance=$script:bubbleTapAdvance;autoQuotesOn=$script:autoQuotesOn;hideMenu=$script:hideMenu;colorMode=$script:colorMode;colorChance=$script:colorChance;colorTextChance=$script:colorTextChance;colorPaused=$script:colorPaused;followHost=$script:followHost;desktopTopmost=$script:desktopTopmost;desktopLeft=$script:desktopLeft;desktopTop=$script:desktopTop}}
 function Get-WidgetPlacementFrame {
   if($script:followHost){return Get-WidgetVisibleFrame}
   $point=if($null-ne $script:desktopLeft -and $null-ne $script:desktopTop){[Drawing.Point]::new([int]$script:desktopLeft,[int]$script:desktopTop)}else{[Drawing.Point]::new(0,0)}
@@ -360,10 +362,12 @@ function Click-Character {
   elseif($script:bubbleMode-ne 'quota'){Switch-Scene 'quota'}
   else{Restart-SceneTtl}
 }
-function Show-Quota {
-  if(!$script:collapsed){if($script:bubbleMode-ne 'quota'){Switch-Scene 'quota'}else{Restart-SceneTtl};return}
+function Show-Quota([string]$mode='quota') {
+  if(!$script:collapsed){if($script:bubbleMode-ne $mode){Switch-Scene $mode}else{Restart-SceneTtl};return}
   $script:bubbleEpoch++;$script:collapsed=$false
-  $script:bubbleMode='quota';Apply-Scene
+  $script:bubbleMode=$mode
+  if($mode-eq 'quote'){$script:ui.QuoteText.Text=Get-WidgetBubbleQuote $script:dataDir;Fit-QuoteText}
+  Apply-Scene
   if($script:sceneTimer){$script:sceneTimer.Stop()}
   if($script:closeTimer){$script:closeTimer.Stop();$script:closeTimer=$null}
   foreach($stage in @(@{name='TailNear';delay=0},@{name='Tail';delay=130},@{name='Bubble';delay=260})){
@@ -378,7 +382,9 @@ function Show-Quota {
   Set-AnimatedValue $script:ui.SceneText ([Windows.UIElement]::OpacityProperty) 0
   Animate-Value $script:ui.SceneText ([Windows.UIElement]::OpacityProperty) 1 160 360
   $script:ui.Bubble.IsHitTestVisible=$true
-  Restart-SceneTtl 520;Request-Refresh;Save-Settings
+  Restart-SceneTtl 520
+  if($mode-eq 'quota'){Request-Refresh}
+  Save-Settings
 }
 function Hide-Quota {
   if($script:collapsed){return}
@@ -408,6 +414,45 @@ function Animate-Press([bool]$down) {
   $x=if($down){1.05}else{1.0};$y=if($down){0.88}else{1.0}
   Animate-Value $script:ui.PressScale ([Windows.Media.ScaleTransform]::ScaleXProperty) $x 220 0 $true
   Animate-Value $script:ui.PressScale ([Windows.Media.ScaleTransform]::ScaleYProperty) $y 220 0 $true
+}
+function Stop-AutoQuotePress {
+  if(!$script:autoQuotePressTimer){return}
+  $script:autoQuotePressTimer.Stop();$script:autoQuotePressTimer=$null
+  if(!$script:drag){Animate-Press $false}
+}
+function Start-AutoQuotePress {
+  Stop-AutoQuotePress
+  Animate-Press $true
+  $script:autoQuotePressTimer=New-Object Windows.Threading.DispatcherTimer
+  $script:autoQuotePressTimer.Interval=[TimeSpan]::FromMilliseconds(220)
+  $script:autoQuotePressTimer.Add_Tick({param($timer,$event)
+    $timer.Stop()
+    if($timer-ne $script:autoQuotePressTimer){return}
+    $script:autoQuotePressTimer=$null
+    if(!$script:drag){Animate-Press $false}
+  })
+  $script:autoQuotePressTimer.Start()
+}
+function Set-WidgetAutoQuotes([bool]$Enabled) {
+  $script:autoQuotesOn=$Enabled;$script:autoQuoteNextAt=0
+  if(!$Enabled){Stop-AutoQuotePress}
+  Save-Settings
+}
+function Tick-AutoQuotes([long]$now) {
+  if(!$script:autoQuotesOn -or !$script:window.IsVisible -or $script:runtimeClosed){
+    $script:autoQuoteNextAt=0;Stop-AutoQuotePress;return
+  }
+  $busy=$script:drag -or !$script:collapsed -or $script:context.IsOpen -or (Test-WidgetUpdateEditor) -or ($script:updateProcess -and !$script:updateProcess.HasExited)
+  if($busy){
+    # A blocked deadline is discarded; never queue quotes behind an interaction.
+    if($now-ge $script:autoQuoteNextAt){$script:autoQuoteNextAt=0}
+    return
+  }
+  if($script:autoQuoteNextAt-le 0){$script:autoQuoteNextAt=$now+(Get-Random -Minimum 20000 -Maximum 40001);return}
+  if($now-lt $script:autoQuoteNextAt){return}
+  Show-Quota 'quote'
+  Start-AutoQuotePress
+  $script:autoQuoteNextAt=$now+(Get-Random -Minimum 20000 -Maximum 40001)
 }
 function Request-Refresh {[IO.File]::WriteAllText((Join-Path $script:dataDir 'refresh.flag'),([DateTime]::UtcNow.ToString('o')+' '+[Guid]::NewGuid().ToString('N')))}
 function Exit-WidgetForSession {
@@ -596,6 +641,7 @@ foreach($control in @($script:ui.Girl,$script:ui.MenuButton)){
 $script:context.Add_Closed({$script:menuTimer.Start()})
 foreach($control in @($script:ui.Bubble,$script:ui.Tail,$script:ui.TailNear)){$control.Add_MouseLeftButtonUp({param($sender,$event)Next-Bubble;$event.Handled=$true})}
 $pressDown={param($sender,$event)
+  Stop-AutoQuotePress;$script:autoQuoteNextAt=0
   $script:hostFollower.Suspend()
   $cursor=New-Object GptWidgetNative+Point;[GptWidgetNative]::GetCursorPos([ref]$cursor)|Out-Null
   $rect=New-Object GptWidgetNative+Rect;[GptWidgetNative]::GetWindowRect($script:widgetHandle,[ref]$rect)|Out-Null
@@ -680,6 +726,7 @@ function Ensure-QuotaWorker([long]$now){
 }
 function Stop-WidgetRuntime {
   if($script:runtimeClosed){return};$script:runtimeClosed=$true
+  try{Stop-AutoQuotePress}catch{}
   try{if($script:hostFollower){$script:hostFollower.Dispose()}}catch{}
   foreach($timer in @($script:timer,$script:hostEventTimer,$script:menuTimer,$script:sceneTimer,$script:resetPhaseTimer,$script:closeTimer)){try{if($timer){$timer.Stop()}}catch{}}
   try{Stop-WidgetAudio}catch{}
@@ -758,6 +805,7 @@ function Tick-Widget {
     [GptWidgetNative]::SetWindowPos($script:widgetHandle,[IntPtr](-2),0,0,0,0,0x13)|Out-Null
     $script:window.Hide()
   }
+  Tick-AutoQuotes $now
   if($now-$script:lastPresence-ge 1000){
     Write-WidgetJson (Join-Path $script:dataDir 'presence.json') @{visible=[bool]$visible;at=$now;host=$script:hostHandle.ToInt64();widget=$script:widgetHandle.ToInt64();pid=$PID;followHost=$script:followHost;follow=@{ready=$script:hostFollower.Ready;events=$script:hostFollower.MovementEvents;mode='native-immediate';animationPaddingDip=14};scene=@{open=!$script:collapsed;mode=$script:bubbleMode;resetTimeMode=$script:resetTimeMode;startedAt=$script:sceneStartedAt;closesAt=$script:sceneDeadline;shortReset=$script:ui.ShortReset.Text;weekReset=$script:ui.WeekReset.Text}}
     Update-Quota;$script:lastPresence=$now

@@ -23,7 +23,7 @@ $source=[IO.File]::ReadAllText($widgetFile,[Text.Encoding]::UTF8)
 $tokens=$null;$parseErrors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$parseErrors)
 if($parseErrors.Count){throw 'The widget source has PowerShell parse errors.'}
-foreach($functionName in @('Ensure-QuotaWorker','Stop-WidgetRuntime')){
+foreach($functionName in @('Ensure-QuotaWorker','Stop-AutoQuotePress','Stop-WidgetRuntime')){
   $definition=$ast.Find({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name-eq $functionName},$true)
   if(!$definition){throw ('Missing lifecycle function: '+$functionName)}
   . ([scriptblock]::Create($definition.Extent.Text))
@@ -64,6 +64,10 @@ setInterval(heartbeat,100);
   $script:timer=[pscustomobject]@{}
   $script:timer|Add-Member -MemberType ScriptMethod -Name Stop -Value {throw 'Injected timer stop failure.'}
   function Stop-WidgetAudio {throw 'Injected audio stop failure.'}
+  function Animate-Press([bool]$down){$script:lastPress=$down}
+  $script:autoQuotePressTimer=[pscustomobject]@{Stopped=$false}
+  $script:autoQuotePressTimer|Add-Member -MemberType ScriptMethod -Name Stop -Value {$this.Stopped=$true}
+  $autoTimer=$script:autoQuotePressTimer;$script:lastPress=$true
 
   Ensure-QuotaWorker ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
   if(!$script:worker){throw 'The dummy quota worker was not launched.'}
@@ -87,6 +91,7 @@ setInterval(heartbeat,100);
   [IO.File]::WriteAllText((Join-Path $script:dataDir 'presence.json'),'{"pid":2147483647}')
   Stop-WidgetRuntime
   Stop-WidgetRuntime
+  Assert-Lifecycle ($autoTimer.Stopped -and !$script:autoQuotePressTimer -and !$script:lastPress) 'Cleanup left an automatic press timer or a pressed character.'
   $deadline=[DateTime]::UtcNow.AddSeconds(2)
   do{
     $remaining=Get-Process -Id $restartedPid -ErrorAction SilentlyContinue
