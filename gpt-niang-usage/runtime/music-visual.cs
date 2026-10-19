@@ -11,12 +11,13 @@ using System.Windows.Threading;
 public sealed class GptMusicMotion {
     public double X,Y,Vx,Vy,Floor,Width,FigureWidth,Dpi,Time,Bend,BendSpeed,Rock,RockSpeed,Lamp,LampSpeed,Pulse,Energy,Cycle;
     public int Impacts,Phase;public double Props;public int Direction=-1;
-    double landed,lockStartPose,lastPointerX,lastPointerY,flightCeiling,pointerIdle;bool wasLocked,hasPointer,throwMomentum;
+    double landed,lockStartPose,lastPointerX,lastPointerY,flightCeiling,pointerIdle,pickupOffset,pickupSpeed;bool wasLocked,hasPointer,throwMomentum;
     public double ThrowX,ThrowY,FigureHeight;
     public double ReleaseIdleMs {get;private set;}
     public bool Held {get;private set;}
-    public void BeginHold(){Held=true;wasLocked=false;Energy=0;BendSpeed=4;Vy=0;Props=0;ThrowX=ThrowY=0;pointerIdle=ReleaseIdleMs=0;hasPointer=false;throwMomentum=false;}
+    public void BeginHold(){Held=true;wasLocked=false;Energy=0;BendSpeed=4;Vy=0;Props=0;ThrowX=ThrowY=0;pointerIdle=ReleaseIdleMs=pickupOffset=pickupSpeed=0;hasPointer=false;throwMomentum=false;}
     public void BeginHold(double pointerX,double pointerY){BeginHold();lastPointerX=pointerX;lastPointerY=pointerY;hasPointer=true;}
+    public void BeginHold(double pointerX,double pointerY,double lift){BeginHold(pointerX,pointerY);pickupOffset=lift;}
     public void SamplePointer(double pointerX,double pointerY,double dt){
         if(dt<=0)return;
         if(hasPointer){
@@ -42,8 +43,10 @@ public sealed class GptMusicMotion {
     public void MoveHeld(double x,double y,double dt,double pointerX,double pointerY){
         SamplePointer(pointerX,pointerY,dt);
         double margin=FlightMargin;X=Clamp(x,margin,Math.Max(margin,Width-margin));
-        double target=Clamp(y,16*Dpi,Floor);Spring(ref Y,ref Vy,target,dt,22,.72);
-        if(Y>Floor){Y=Floor;Vy=Math.Min(0,Vy);}
+        // Ease only the initial pickup lift. Pointer movement itself must not
+        // pass through a spring, which adds visible lag to every direction change.
+        Spring(ref pickupOffset,ref pickupSpeed,0,dt,22,.72);
+        Y=Clamp(y+pickupOffset,16*Dpi,Floor);Vy=0;
     }
     public void Release(){
         if(!Held)return;Held=false;Phase=0;Impacts=0;Props=0;Vx=ThrowX;Vy=ThrowY;ReleaseIdleMs=pointerIdle*1000;
@@ -165,7 +168,7 @@ public sealed class GptMusicVisual : IDisposable {
     public GptMusicAudioSnapshot Audio {get;private set;}
     public IntPtr LampHandle {get{return lampSource==null?IntPtr.Zero:lampSource.Handle;}}
     public void BeginHold(double cursorX,double cursorY){
-        if(Motion==null)return;var f=FrameBounds();grabX=Motion.X-(cursorX-f.Left);grabY=Motion.Y-(cursorY-f.Top)-Math.Min(52*dpi,figurePhysical*.45);Motion.BeginHold(cursorX,cursorY);lastGrabAt=GptMusicCapture.NowMs;Redraw();
+        if(Motion==null)return;var f=FrameBounds();double lift=Math.Min(52*dpi,figurePhysical*.45);grabX=Motion.X-(cursorX-f.Left);grabY=Motion.Y-(cursorY-f.Top)-lift;Motion.BeginHold(cursorX,cursorY,lift);lastGrabAt=GptMusicCapture.NowMs;Redraw();
     }
     public void EndHold(){
         if(Motion==null||!Motion.Held)return;
@@ -271,7 +274,9 @@ public sealed class GptMusicVisual : IDisposable {
         if(pendingPosition!=null&&pendingPosition.Status==DispatcherOperationStatus.Pending)return;
         // Moving a layered HWND from its own Rendering callback can stall
         // composition. Deliver one latest position after that render completes.
-        pendingPosition=window.Dispatcher.BeginInvoke(DispatcherPriority.Background,new Action(delegate{pendingPosition=null;ApplyPosition();}));
+        // Keep delivery outside Rendering, but do not put flight movement behind
+        // all other non-idle work. Coalescing still delivers only the latest pose.
+        pendingPosition=window.Dispatcher.BeginInvoke(DispatcherPriority.Input,new Action(delegate{pendingPosition=null;ApplyPosition();}));
     }
     void Frame(object sender,EventArgs e) {
         if(!Enabled||disposed)return;
@@ -296,7 +301,7 @@ public sealed class GptMusicVisual : IDisposable {
                 RequestPosition();
             }
             if(changed){under.InvalidateVisual();over.InvalidateVisual();}
-            PositionLamp(frame,visible&&allowed&&window.IsVisible,changed);wasPaused=Paused;
+            PositionLamp(frame,visible&&allowed&&window.IsVisible,false);wasPaused=Paused;
         } catch(Exception ex) {Error=ex.ToString();Stop(false);}
     }
     void PositionLamp(Rect frame,bool show,bool redraw) {
@@ -310,7 +315,7 @@ public sealed class GptMusicVisual : IDisposable {
         }
         if(Math.Abs(lampArt.Diameter-d)>.01)redraw=true;
         lampArt.Width=w;lampArt.Height=h;lampArt.Diameter=d;lampArt.Top=follow?52:4;
-        if(redraw&&GptMusicCapture.NowMs-lastLightPaint>=1000.0/30){lampArt.InvalidateVisual();lastLightPaint=GptMusicCapture.NowMs;}
+        if((redraw||lampArt.NeedsRedraw)&&GptMusicCapture.NowMs-lastLightPaint>=1000.0/30){lampArt.InvalidateVisual();lastLightPaint=GptMusicCapture.NowMs;}
         int band=(MusicNative.GetWindowLongPtr(follow?host:widget,-20).ToInt64()&8)!=0?1:0;
         if(lampBand!=band){MusicNative.SetWindowPos(lampSource.Handle,band==1?new IntPtr(-1):new IntPtr(-2),0,0,0,0,0x213);lampBand=band;}
         int x=(int)Math.Round(frame.Left),y=(int)Math.Round(frame.Top),pw=(int)Math.Round(frame.Width),ph=(int)Math.Round(frame.Height);MusicNative.Rect current;
@@ -405,13 +410,41 @@ public sealed class GptMusicVisual : IDisposable {
     sealed class MusicLamp : FrameworkElement {
         readonly GptMusicVisual owner;public double Diameter=56,Top=52;
         readonly Brush[] beams;readonly Brush halo,leftWash,rightWash;
+        readonly DrawingGroup tiles;
+        readonly RadialGradientBrush shade;
+        static readonly Pen CablePen=new Pen(Brush("#aaa0b1"),1),BallPen=new Pen(Trim,1.5);
+        static readonly Brush Sparkle=Brush("#fff9ff");
+        static readonly Geometry SparkleShape=Geometry.Parse("M -10,-23 L -8,-16 L -1,-14 L -8,-12 L -10,-5 L -12,-12 L -19,-14 L -12,-16 Z");
+        double paintedWidth,paintedHeight,paintedDiameter,paintedTop,paintedArtTime,paintedCycle,paintedEnergy,paintedPulse,paintedProps,paintedLamp;
+        bool painted;
         static readonly Geometry Fan=Geometry.Parse("M 0,0 L -.30,1 L .30,1 Z");
+        // Character pickup and flight change its HWND and bend, not the room
+        // lighting. Keep that large transparent surface retained until one of
+        // the values actually used by its drawing changes.
+        public bool NeedsRedraw {
+            get {
+                var m=owner.Motion;
+                return !painted||m==null||paintedWidth!=Width||paintedHeight!=Height||paintedDiameter!=Diameter||paintedTop!=Top||
+                    paintedArtTime!=owner.artTime||paintedCycle!=m.Cycle||paintedEnergy!=m.Energy||paintedPulse!=m.Pulse||paintedProps!=m.Props||paintedLamp!=m.Lamp;
+            }
+        }
         static RadialGradientBrush Glow(Color c){var b=new RadialGradientBrush();b.GradientStops.Add(new GradientStop(c,0));b.GradientStops.Add(new GradientStop(Color.FromArgb((byte)(c.A/2),c.R,c.G,c.B),.45));b.GradientStops.Add(new GradientStop(Color.FromArgb(0,c.R,c.G,c.B),1));b.Freeze();return b;}
         static LinearGradientBrush Beam(Color c){var b=new LinearGradientBrush(c,Color.FromArgb(0,c.R,c.G,c.B),90);b.Freeze();return b;}
         public MusicLamp(GptMusicVisual owner){
             this.owner=owner;IsHitTestVisible=false;
             beams=new Brush[]{Beam(Color.FromArgb(110,246,72,197)),Beam(Color.FromArgb(95,72,222,245)),Beam(Color.FromArgb(100,174,100,253))};
             halo=Glow(Color.FromArgb(220,147,228,255));leftWash=Glow(Color.FromArgb(65,40,205,240));rightWash=Glow(Color.FromArgb(75,224,55,197));
+            var colors=new Brush[owner.palette.Length];
+            for(int i=0;i<colors.Length;i++){var color=new SolidColorBrush(owner.palette[i]);color.Freeze();colors[i]=color;}
+            tiles=new DrawingGroup();
+            using(var dc=tiles.Open()){
+                for(int row=0;row<12;row++)for(int col=0;col<15;col++){
+                    int index=(row*7+col*3+col/3)%(owner.palette.Length-1);
+                    dc.DrawRectangle(colors[index],null,new Rect(-37.5+col*5,-30+row*5,4.35,4.35));
+                }
+            }
+            tiles.Freeze();
+            shade=new RadialGradientBrush(Color.FromArgb(0,18,12,27),Color.FromArgb(100,18,12,27));shade.Center=shade.GradientOrigin=new Point(.32,.28);shade.Freeze();
         }
         void DrawRoom(DrawingContext dc,GptMusicMotion m,double scale){
             dc.DrawEllipse(leftWash,null,new Point(Width*.05,Height*.65),Width*.75,Height*.8);
@@ -428,18 +461,17 @@ public sealed class GptMusicVisual : IDisposable {
         }
         protected override void OnRender(DrawingContext dc) {
             var m=owner.Motion;if(m==null)return;double radius=Diameter/2,s=Diameter/56;
+            painted=true;paintedWidth=Width;paintedHeight=Height;paintedDiameter=Diameter;paintedTop=Top;paintedArtTime=owner.artTime;
+            paintedCycle=m.Cycle;paintedEnergy=m.Energy;paintedPulse=m.Pulse;paintedProps=m.Props;paintedLamp=m.Lamp;
             DrawRoom(dc,m,s);
             dc.PushOpacity(Math.Max(.3,m.Props));dc.PushTransform(new TranslateTransform(Width/2,Top));dc.PushTransform(new RotateTransform(m.Lamp));dc.PushTransform(new ScaleTransform(s,s));
-            dc.DrawLine(new Pen(Brush("#aaa0b1"),1),new Point(0,0),new Point(0,16));dc.PushTransform(new TranslateTransform(0,44));
+            dc.DrawLine(CablePen,new Point(0,0),new Point(0,16));dc.PushTransform(new TranslateTransform(0,44));
             dc.DrawEllipse(Shell,null,new Point(0,0),28,28);dc.PushClip(new EllipseGeometry(new Point(0,0),28,28));
             double phase=(owner.artTime*4)%5-2.5;
-            for(int row=0;row<12;row++)for(int col=0;col<15;col++){
-                int index=(row*7+col*3+col/3)%(owner.palette.Length-1);
-                dc.DrawRectangle(new SolidColorBrush(owner.palette[index]),null,new Rect(-37.5+col*5+phase,-30+row*5,4.35,4.35));
-            }
-            var shade=new RadialGradientBrush(Color.FromArgb(0,18,12,27),Color.FromArgb(100,18,12,27));shade.Center=shade.GradientOrigin=new Point(.32,.28);dc.DrawEllipse(shade,null,new Point(),28,28);dc.Pop();
-            dc.DrawEllipse(null,new Pen(Trim,1.5),new Point(),28,28);
-            var sparkle=Brush("#fff9ff");dc.DrawGeometry(sparkle,null,Geometry.Parse("M -10,-23 L -8,-16 L -1,-14 L -8,-12 L -10,-5 L -12,-12 L -19,-14 L -12,-16 Z"));
+            dc.PushTransform(new TranslateTransform(phase,0));dc.DrawDrawing(tiles);dc.Pop();
+            dc.DrawEllipse(shade,null,new Point(),28,28);dc.Pop();
+            dc.DrawEllipse(null,BallPen,new Point(),28,28);
+            dc.DrawGeometry(Sparkle,null,SparkleShape);
             dc.Pop();dc.Pop();dc.Pop();dc.Pop();dc.Pop();
         }
     }
